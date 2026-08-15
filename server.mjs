@@ -112,16 +112,19 @@ function buildLightOffer(offerXml) {
   const id = attrValue(attrs, 'id');
   const availableAttr = attrValue(attrs, 'available');
 
-  // Text direction: RU ONLY.
-  // We intentionally keep only the unsuffixed source fields <name> and
-  // <description>. UA fields are not read, copied, generated, or filled.
+  // Keep RU and UA independently. No cross-language fallback.
+  // UA source may use either *_ua or *_uk, so normalize it to *_ua downstream.
   const nameRu = tagInner(body, 'name');
+  const nameUa = tagInner(body, 'name_ua') || tagInner(body, 'name_uk');
   const descriptionRu = tagInner(body, 'description');
+  const descriptionUa = tagInner(body, 'description_ua') || tagInner(body, 'description_uk');
 
   const parts = [];
 
   if (nameRu !== '') parts.push(`<name>${nameRu}</name>`);
+  if (nameUa !== '') parts.push(`<name_ua>${nameUa}</name_ua>`);
   if (descriptionRu !== '') parts.push(`<description>${descriptionRu}</description>`);
+  if (descriptionUa !== '') parts.push(`<description_ua>${descriptionUa}</description_ua>`);
 
   const technicalTags = [
     'available',
@@ -224,7 +227,7 @@ async function runSync(jobId) {
       offerBodies,
       categoriesById,
       numberByOriginalId,
-      ruOnly: true,
+      languageMode: 'ru+ua',
     });
 
     state.offersSent += count;
@@ -239,7 +242,7 @@ async function runSync(jobId) {
     method: 'GET',
     headers: {
       'accept': 'application/xml,text/xml,*/*',
-      'user-agent': 'DROPIT-RU-Stream-Proxy/0.2',
+      'user-agent': 'DROPIT-Stream-Proxy/0.3',
     },
     redirect: 'follow',
   });
@@ -394,7 +397,7 @@ const server = http.createServer((req, res) => {
       accepted: true,
       jobId,
       batchSize: BATCH_SIZE,
-      ruOnly: true,
+      languageMode: 'ru+ua',
     });
   }
 
