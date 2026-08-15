@@ -1,7 +1,6 @@
 import http from 'node:http';
 
-const PROXY_VERSION = '0.4';
-
+const PROXY_VERSION = '0.4.1';
 const PORT = Number(process.env.PORT || 3000);
 const SOURCE_XML_URL = process.env.SOURCE_XML_URL || '';
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
@@ -12,6 +11,7 @@ const N8N_WEBHOOK_AUTH_VALUE = process.env.N8N_WEBHOOK_AUTH_VALUE || '';
 
 const state = {
   running: false,
+  mode: null,
   jobId: null,
   startedAt: null,
   finishedAt: null,
@@ -76,12 +76,10 @@ function attrValue(attrs, name) {
 
 function parseCategory(categoryXml) {
   const open = categoryXml.match(/^<category\b([^>]*)>/i);
-
   if (!open) return null;
 
   const attrs = open[1] || '';
   const id = attrValue(attrs, 'id');
-
   if (!id) return null;
 
   const parentId = attrValue(attrs, 'parentId');
@@ -91,68 +89,30 @@ function parseCategory(categoryXml) {
     .replace(/<\/category>\s*$/i, '')
     .trim();
 
-  const cdata = name.match(
-    /^<!\[CDATA\[([\s\S]*?)\]\]>$/,
-  );
-
-  if (cdata) {
-    name = cdata[1];
-  }
+  const cdata = name.match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
+  if (cdata) name = cdata[1];
 
   name = name
     .replace(/<[^>]+>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 
-  return {
-    id,
-    parentId,
-    name,
-  };
+  return { id, parentId, name };
 }
 
 function buildOfferPayload(offerXml) {
   const open = offerXml.match(/^<offer\b([^>]*)>/i);
+  if (!open) return null;
 
-  if (!open) {
-    return null;
-  }
-
-  /*
-   * v0.4
-   *
-   * НІЧОГО всередині offer більше не вирізаємо.
-   *
-   * Передаємо повністю:
-   *
-   * name
-   * name_ua
-   * name_uk
-   * description
-   * description_ua
-   * description_uk
-   * price
-   * currencyId
-   * categoryId
-   * vendor
-   * vendorCode
-   * barcode
-   * quantity
-   * ВСІ picture
-   * ВСІ param
-   * та будь-які інші поля постачальника.
-   */
-
+  // v0.4.1: передаємо ВСІ атрибути offer і ПОВНЕ внутрішнє XML.
+  // Тобто не губляться picture, categoryId, vendor, param, RU/UA поля тощо.
   const attrs = open[1] || '';
 
   const body = offerXml
     .slice(open[0].length)
     .replace(/<\/offer>\s*$/i, '');
 
-  return {
-    attrs,
-    body,
-  };
+  return { attrs, body };
 }
 
 async function postBatch(payload) {
@@ -160,37 +120,25 @@ async function postBatch(payload) {
     'content-type': 'application/json',
   };
 
-  if (
-    N8N_WEBHOOK_AUTH_HEADER &&
-    N8N_WEBHOOK_AUTH_VALUE
-  ) {
-    headers[N8N_WEBHOOK_AUTH_HEADER] =
-      N8N_WEBHOOK_AUTH_VALUE;
+  if (N8N_WEBHOOK_AUTH_HEADER && N8N_WEBHOOK_AUTH_VALUE) {
+    headers[N8N_WEBHOOK_AUTH_HEADER] = N8N_WEBHOOK_AUTH_VALUE;
   }
 
   let lastError;
 
   for (let attempt = 1; attempt <= 4; attempt++) {
     try {
-      const response = await fetch(
-        N8N_WEBHOOK_URL,
-        {
-          method: 'POST',
-          headers,
-          body: JSON.stringify(payload),
-        },
-      );
+      const response = await fetch(N8N_WEBHOOK_URL, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
 
       if (!response.ok) {
-        const text = await response
-          .text()
-          .catch(() => '');
+        const text = await response.text().catch(() => '');
 
         throw new Error(
-          `n8n webhook ${response.status}: ${text.slice(
-            0,
-            500,
-          )}`,
+          `n8n webhook ${response.status}: ${text.slice(0, 500)}`,
         );
       }
 
@@ -200,10 +148,7 @@ async function postBatch(payload) {
 
       if (attempt < 4) {
         await new Promise((resolve) =>
-          setTimeout(
-            resolve,
-            1000 * 2 ** (attempt - 1),
-          ),
+          setTimeout(resolve, 1000 * 2 ** (attempt - 1)),
         );
       }
     }
@@ -212,20 +157,23 @@ async function postBatch(payload) {
   throw lastError;
 }
 
-async function runSync(jobId) {
+async function runSync(jobId, options = {}) {
+  const mode = options.mode || 'full';
+
+  const maxBatches = Number.isFinite(options.maxBatches)
+    ? Math.max(1, Number(options.maxBatches))
+    : null;
+
   if (!SOURCE_XML_URL) {
-    throw new Error(
-      'SOURCE_XML_URL is not configured',
-    );
+    throw new Error('SOURCE_XML_URL is not configured');
   }
 
   if (!N8N_WEBHOOK_URL) {
-    throw new Error(
-      'N8N_WEBHOOK_URL is not configured',
-    );
+    throw new Error('N8N_WEBHOOK_URL is not configured');
   }
 
   state.running = true;
+  state.mode = mode;
   state.jobId = jobId;
   state.startedAt = nowIso();
   state.finishedAt = null;
@@ -240,30 +188,20 @@ async function runSync(jobId) {
   state.lastError = null;
   state.lastResult = null;
 
-  /*
-   * Категорії читаємо один раз на початку XML.
-   */
-
-  const categoriesById =
-    Object.create(null);
-
-  const numberByOriginalId =
-    Object.create(null);
+  const categoriesById = Object.create(null);
+  const numberByOriginalId = Object.create(null);
 
   let categoryNumber = 0;
 
-  /*
-   * Поточний batch.
-   */
-
   let offerAttrs = [];
   let offerBodies = [];
-
   let batchIndex = 0;
 
-  async function flushBatch() {
+  let stoppedByBatchLimit = false;
+
+  const flushBatch = async () => {
     if (offerBodies.length === 0) {
-      return;
+      return false;
     }
 
     const count = offerBodies.length;
@@ -282,6 +220,7 @@ async function runSync(jobId) {
 
       proxyVersion: PROXY_VERSION,
       payloadMode: 'full-offer-body',
+      syncMode: mode,
     });
 
     state.offersSent += count;
@@ -290,39 +229,32 @@ async function runSync(jobId) {
 
     batchIndex += 1;
 
-    /*
-     * Старий batch звільняємо.
-     */
-
     offerAttrs = [];
     offerBodies = [];
-  }
 
-  /*
-   * Головний запит до DropIT.
-   *
-   * ВАЖЛИВО:
-   * response.text() тут НЕ використовується.
-   *
-   * XML читається потоком.
-   */
+    if (
+      maxBatches !== null &&
+      state.batchesSent >= maxBatches
+    ) {
+      stoppedByBatchLimit = true;
+      return true;
+    }
 
-  const response = await fetch(
-    SOURCE_XML_URL,
-    {
-      method: 'GET',
+    return false;
+  };
 
-      headers: {
-        accept:
-          'application/xml,text/xml,*/*',
+  const response = await fetch(SOURCE_XML_URL, {
+    method: 'GET',
 
-        'user-agent':
-          `DROPIT-Stream-Proxy/${PROXY_VERSION}`,
-      },
+    headers: {
+      accept: 'application/xml,text/xml,*/*',
 
-      redirect: 'follow',
+      'user-agent':
+        `DROPIT-Stream-Proxy/${PROXY_VERSION}`,
     },
-  );
+
+    redirect: 'follow',
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -336,32 +268,14 @@ async function runSync(jobId) {
     );
   }
 
-  const reader =
-    response.body.getReader();
-
-  const decoder =
-    new TextDecoder('utf-8');
-
-  /*
-   * Тут знаходиться лише невелика частина XML.
-   */
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder('utf-8');
 
   let buffer = '';
-
-  /*
-   * До першого offer збираємо categories.
-   */
-
   let offersStarted = false;
 
-  async function processBuffer() {
+  const processBuffer = async () => {
     while (true) {
-      /*
-       * --------------------------------
-       * CATEGORY MODE
-       * --------------------------------
-       */
-
       if (!offersStarted) {
         const offerMatch =
           buffer.match(/<offer\b/i);
@@ -379,11 +293,6 @@ async function runSync(jobId) {
             ? catMatch.index
             : -1;
 
-        /*
-         * Якщо category знаходиться
-         * раніше першого offer.
-         */
-
         if (
           catPos >= 0 &&
           (
@@ -397,18 +306,13 @@ async function runSync(jobId) {
               catPos,
             );
 
-          /*
-           * category ще не повністю
-           * прийшла з мережі.
-           */
-
           if (end < 0) {
             if (catPos > 0) {
               buffer =
                 buffer.slice(catPos);
             }
 
-            return;
+            return false;
           }
 
           const categoryXml =
@@ -452,10 +356,6 @@ async function runSync(jobId) {
           continue;
         }
 
-        /*
-         * Дійшли до товарів.
-         */
-
         if (offerPos >= 0) {
           buffer =
             buffer.slice(
@@ -467,82 +367,42 @@ async function runSync(jobId) {
           continue;
         }
 
-        /*
-         * Щоб службова частина XML
-         * до offers не накопичувалась.
-         */
-
         if (buffer.length > 8192) {
           buffer =
             buffer.slice(-8192);
         }
 
-        return;
+        return false;
       }
-
-      /*
-       * --------------------------------
-       * OFFER MODE
-       * --------------------------------
-       */
 
       const startMatch =
         buffer.match(/<offer\b/i);
 
-      /*
-       * Початку offer ще немає.
-       */
-
       if (!startMatch) {
-        /*
-         * Залишаємо невеликий хвіст,
-         * якщо "<offer" розірвало
-         * між двома network chunk.
-         */
-
         if (buffer.length > 64) {
           buffer =
             buffer.slice(-64);
         }
 
-        return;
+        return false;
       }
 
       const start =
         startMatch.index;
-
-      /*
-       * Все перед offer вже не потрібне.
-       */
 
       if (start > 0) {
         buffer =
           buffer.slice(start);
       }
 
-      /*
-       * Шукаємо кінець товару.
-       */
-
       const end =
         buffer.indexOf(
           '</offer>',
         );
 
-      /*
-       * Offer ще не прийшов повністю.
-       *
-       * Зберігаємо його до наступного
-       * network chunk.
-       */
-
       if (end < 0) {
-        return;
+        return false;
       }
-
-      /*
-       * Вирізаємо ОДИН повний offer.
-       */
 
       const offerXml =
         buffer.slice(
@@ -551,10 +411,6 @@ async function runSync(jobId) {
             '</offer>'.length,
         );
 
-      /*
-       * Видаляємо його з буфера.
-       */
-
       buffer =
         buffer.slice(
           end +
@@ -562,13 +418,6 @@ async function runSync(jobId) {
         );
 
       state.offersSeen += 1;
-
-      /*
-       * У v0.4 buildOfferPayload
-       * НЕ вирізає поля.
-       *
-       * Зберігається все тіло offer.
-       */
 
       const offer =
         buildOfferPayload(
@@ -585,32 +434,19 @@ async function runSync(jobId) {
         );
       }
 
-      /*
-       * Batch готовий.
-       */
-
       if (
         offerBodies.length >=
         BATCH_SIZE
       ) {
-        /*
-         * Backpressure.
-         *
-         * Поки n8n не прийняв batch,
-         * наступну частину XML
-         * активно не читаємо.
-         */
+        const shouldStop =
+          await flushBatch();
 
-        await flushBatch();
+        if (shouldStop) {
+          return true;
+        }
       }
     }
-  }
-
-  /*
-   * --------------------------------
-   * STREAM READER
-   * --------------------------------
-   */
+  };
 
   while (true) {
     const {
@@ -633,31 +469,32 @@ async function runSync(jobId) {
         },
       );
 
-    await processBuffer();
+    const shouldStop =
+      await processBuffer();
+
+    if (shouldStop) {
+      await reader
+        .cancel(
+          'sync batch limit reached',
+        )
+        .catch(() => {});
+
+      buffer = '';
+
+      break;
+    }
   }
 
-  /*
-   * Фінальний хвіст UTF-8.
-   */
+  if (!stoppedByBatchLimit) {
+    buffer += decoder.decode();
 
-  buffer += decoder.decode();
+    const shouldStop =
+      await processBuffer();
 
-  await processBuffer();
-
-  /*
-   * Останній batch.
-   *
-   * Наприклад:
-   * 44 товари замість 100.
-   */
-
-  await flushBatch();
-
-  /*
-   * --------------------------------
-   * RESULT
-   * --------------------------------
-   */
+    if (!shouldStop) {
+      await flushBatch();
+    }
+  }
 
   state.lastResult = {
     jobId,
@@ -667,6 +504,13 @@ async function runSync(jobId) {
 
     payloadMode:
       'full-offer-body',
+
+    syncMode:
+      mode,
+
+    maxBatches,
+
+    stoppedByBatchLimit,
 
     offersSeen:
       state.offersSeen,
@@ -685,20 +529,16 @@ async function runSync(jobId) {
   };
 }
 
-function startSync() {
+function startSync(options = {}) {
   const jobId =
     `${Date.now()}-${Math.random()
       .toString(36)
       .slice(2, 8)}`;
 
-  /*
-   * runSync працює у фоні.
-   *
-   * POST /sync відразу повертає
-   * accepted=true.
-   */
-
-  void runSync(jobId)
+  void runSync(
+    jobId,
+    options,
+  )
     .catch((err) => {
       state.lastError = {
         at: nowIso(),
@@ -711,18 +551,11 @@ function startSync() {
     })
     .finally(() => {
       state.running = false;
-      state.finishedAt =
-        nowIso();
+      state.finishedAt = nowIso();
     });
 
   return jobId;
 }
-
-/*
- * --------------------------------
- * HTTP SERVER
- * --------------------------------
- */
 
 const server =
   http.createServer(
@@ -730,15 +563,8 @@ const server =
       const url =
         new URL(
           req.url || '/',
-          `http://${
-            req.headers.host ||
-            'localhost'
-          }`,
+          `http://${req.headers.host || 'localhost'}`,
         );
-
-      /*
-       * HEALTH
-       */
 
       if (
         req.method === 'GET' &&
@@ -762,16 +588,11 @@ const server =
         );
       }
 
-      /*
-       * AUTH
-       */
-
       if (
         (
-          url.pathname ===
-            '/sync' ||
-          url.pathname ===
-            '/status'
+          url.pathname === '/sync' ||
+          url.pathname === '/sync-test' ||
+          url.pathname === '/status'
         ) &&
         !isAuthorized(req)
       ) {
@@ -785,14 +606,9 @@ const server =
         );
       }
 
-      /*
-       * STATUS
-       */
-
       if (
         req.method === 'GET' &&
-        url.pathname ===
-          '/status'
+        url.pathname === '/status'
       ) {
         return json(
           res,
@@ -801,20 +617,10 @@ const server =
         );
       }
 
-      /*
-       * SYNC
-       */
-
       if (
         req.method === 'POST' &&
-        url.pathname ===
-          '/sync'
+        url.pathname === '/sync-test'
       ) {
-        /*
-         * Другий sync одночасно
-         * не запускаємо.
-         */
-
         if (state.running) {
           return json(
             res,
@@ -833,13 +639,73 @@ const server =
         }
 
         const jobId =
-          startSync();
+          startSync({
+            mode: 'test',
+            maxBatches: 1,
+          });
 
         return json(
           res,
           202,
           {
             accepted: true,
+
+            testMode: true,
+
+            jobId,
+
+            batchSize:
+              BATCH_SIZE,
+
+            maxBatches: 1,
+
+            expectedN8nWebhookExecutions: 1,
+
+            languageMode:
+              'ru+ua',
+
+            proxyVersion:
+              PROXY_VERSION,
+
+            payloadMode:
+              'full-offer-body',
+          },
+        );
+      }
+
+      if (
+        req.method === 'POST' &&
+        url.pathname === '/sync'
+      ) {
+        if (state.running) {
+          return json(
+            res,
+            409,
+            {
+              error:
+                'Sync already running',
+
+              jobId:
+                state.jobId,
+
+              status:
+                publicState(),
+            },
+          );
+        }
+
+        const jobId =
+          startSync({
+            mode: 'full',
+          });
+
+        return json(
+          res,
+          202,
+          {
+            accepted: true,
+
+            testMode: false,
 
             jobId,
 
@@ -858,10 +724,6 @@ const server =
         );
       }
 
-      /*
-       * 404
-       */
-
       return json(
         res,
         404,
@@ -871,8 +733,9 @@ const server =
 
           endpoints: [
             'GET /health',
-            'POST /sync',
             'GET /status',
+            'POST /sync-test',
+            'POST /sync',
           ],
         },
       );
